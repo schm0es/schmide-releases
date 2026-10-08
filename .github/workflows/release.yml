@@ -29,7 +29,11 @@ jobs:
           - { os: ubuntu-22.04, asset: schmide-linux-x86_64.tar.gz }
           - { os: ubuntu-22.04-arm, asset: schmide-linux-aarch64.tar.gz }
           - { os: macos-latest, asset: schmide-macos-universal.app.tar.gz }
+          - { os: windows-latest, asset: schmide-windows-x86_64-setup.exe }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -90,6 +94,29 @@ jobs:
           npx tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
           tar -czf ${{ matrix.asset }} -C src-tauri/target/universal-apple-darwin/release/bundle/macos schmide.app
 
+      # NSIS, per-user (no admin); the same setup.exe updates an installed copy.
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          SCHMIDE_RELEASE: "1"
+        run: |
+          npx tauri build --bundles nsis
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe ${{ matrix.asset }}
+
+      # No Windows machine checks a release otherwise: install it silently and
+      # see that it starts and stays up.
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Process ./${{ matrix.asset }} -ArgumentList '/S' -Wait
+          $exe = "$env:LOCALAPPDATA\schmide\schmide.exe"
+          if (-not (Test-Path $exe)) { throw "not installed at $exe" }
+          $p = Start-Process $exe -PassThru
+          Start-Sleep 15
+          if ($p.HasExited) { throw "schmide exited with $($p.ExitCode)" }
+          Stop-Process $p
+
       - name: Sign
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -98,7 +125,7 @@ jobs:
 
       - name: Installer
         if: matrix.os == 'ubuntu-22.04'
-        run: mkdir -p extra && cp scripts/install.sh extra/install.sh
+        run: mkdir -p extra && cp scripts/install.sh scripts/install.ps1 extra/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,6 +134,7 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sig
             extra/install.sh
+            extra/install.ps1
 
   publish:
     needs: build
@@ -123,7 +151,7 @@ jobs:
           NOTES: ${{ inputs.notes }}
           BASE: https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}
         run: |
-          mv dist/extra/install.sh dist/ && rmdir dist/extra
+          mv dist/extra/* dist/ && rmdir dist/extra
           python3 - <<'EOF'
           import json, os, datetime
           base, d = os.environ["BASE"], "dist"
@@ -139,6 +167,7 @@ jobs:
                   "linux-aarch64": entry("schmide-linux-aarch64.tar.gz"),
                   "darwin-aarch64": mac,
                   "darwin-x86_64": mac,
+                  "windows-x86_64": entry("schmide-windows-x86_64-setup.exe"),
               },
           }, open(f"{d}/latest.json", "w"), indent=2)
           EOF
