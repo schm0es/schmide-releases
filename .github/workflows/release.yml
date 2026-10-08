@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Source tag to build, e.g. v0.2.0 (its tauri.conf.json must say 0.2.0)"
+        description: "Source tag to build, e.g. v0.2.0 (its tauri.conf.json must say 0.2.0); a commit works for a draft"
         required: true
       notes:
         description: "Release notes"
@@ -30,6 +30,8 @@ jobs:
           - { os: ubuntu-22.04-arm, asset: schmide-linux-aarch64.tar.gz }
           - { os: macos-latest, asset: schmide-macos-universal.app.tar.gz }
     runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,12 +39,15 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
 
-      - name: Check the version
+      - name: Version
+        id: version
         env:
           REF: ${{ inputs.ref }}
+          DRAFT: ${{ inputs.draft }}
         run: |
           v=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          [ "v$v" = "$REF" ] || { echo "::error::$REF is not v$v (src-tauri/tauri.conf.json)"; exit 1; }
+          if [ "v$v" != "$REF" ] && [ "$DRAFT" != true ]; then echo "::error::$REF is not v$v (src-tauri/tauri.conf.json)"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
@@ -114,9 +119,9 @@ jobs:
 
       - name: latest.json
         env:
-          REF: ${{ inputs.ref }}
+          V: ${{ needs.build.outputs.version }}
           NOTES: ${{ inputs.notes }}
-          BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.ref }}
+          BASE: https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}
         run: |
           mv dist/extra/install.sh dist/ && rmdir dist/extra
           python3 - <<'EOF'
@@ -126,7 +131,7 @@ jobs:
               return {"url": f"{base}/{asset}", "signature": open(f"{d}/{asset}.sig").read()}
           mac = entry("schmide-macos-universal.app.tar.gz")
           json.dump({
-              "version": os.environ["REF"].lstrip("v"),
+              "version": os.environ["V"],
               "notes": os.environ["NOTES"],
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": {
@@ -142,10 +147,10 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-          REF: ${{ inputs.ref }}
+          V: ${{ needs.build.outputs.version }}
           NOTES: ${{ inputs.notes }}
           DRAFT: ${{ inputs.draft }}
         run: |
           args=()
           [ "$DRAFT" = true ] && args+=(--draft)
-          gh release create "$REF" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "schmide ${REF#v}" --notes "$NOTES" "${args[@]}"
+          gh release create "v$V" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "schmide $V" --notes "$NOTES" "${args[@]}"
