@@ -1,0 +1,151 @@
+# Builds a tag of the (private) schmide source and publishes it here: one
+# archive per platform, each signed with the updater key, plus latest.json
+# (what installed apps check for updates) and install.sh (the curl installer).
+# Started by scripts/release.sh in the source repo, or by hand from the Actions tab.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source tag to build, e.g. v0.2.0 (its tauri.conf.json must say 0.2.0)"
+        required: true
+      notes:
+        description: "Release notes"
+        default: ""
+      draft:
+        description: "Publish as a draft (not offered to installs and updates until published)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, asset: schmide-linux-x86_64.tar.gz }
+          - { os: ubuntu-22.04-arm, asset: schmide-linux-aarch64.tar.gz }
+          - { os: macos-latest, asset: schmide-macos-universal.app.tar.gz }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: schm0es/schmide
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Check the version
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          v=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          [ "v$v" = "$REF" ] || { echo "::error::$REF is not v$v (src-tauri/tauri.conf.json)"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
+      - run: npm ci
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          SCHMIDE_RELEASE: "1"
+        run: |
+          npx tauri build --no-bundle
+          mkdir -p out/icons
+          cp src-tauri/target/release/schmide out/
+          cp src-tauri/icons/{32x32,64x64,128x128,128x128@2x,icon}.png out/icons/
+          tar -czf ${{ matrix.asset }} -C out schmide icons
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SCHMIDE_RELEASE: "1"
+        run: |
+          npx tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
+          tar -czf ${{ matrix.asset }} -C src-tauri/target/universal-apple-darwin/release/bundle/macos schmide.app
+
+      - name: Sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: npx tauri signer sign ${{ matrix.asset }}
+
+      - name: Installer
+        if: matrix.os == 'ubuntu-22.04'
+        run: mkdir -p extra && cp scripts/install.sh extra/install.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sig
+            extra/install.sh
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: latest.json
+        env:
+          REF: ${{ inputs.ref }}
+          NOTES: ${{ inputs.notes }}
+          BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.ref }}
+        run: |
+          mv dist/extra/install.sh dist/ && rmdir dist/extra
+          python3 - <<'EOF'
+          import json, os, datetime
+          base, d = os.environ["BASE"], "dist"
+          def entry(asset):
+              return {"url": f"{base}/{asset}", "signature": open(f"{d}/{asset}.sig").read()}
+          mac = entry("schmide-macos-universal.app.tar.gz")
+          json.dump({
+              "version": os.environ["REF"].lstrip("v"),
+              "notes": os.environ["NOTES"],
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "linux-x86_64": entry("schmide-linux-x86_64.tar.gz"),
+                  "linux-aarch64": entry("schmide-linux-aarch64.tar.gz"),
+                  "darwin-aarch64": mac,
+                  "darwin-x86_64": mac,
+              },
+          }, open(f"{d}/latest.json", "w"), indent=2)
+          EOF
+          ls -l dist
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+          NOTES: ${{ inputs.notes }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          args=()
+          [ "$DRAFT" = true ] && args+=(--draft)
+          gh release create "$REF" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "schmide ${REF#v}" --notes "$NOTES" "${args[@]}"
