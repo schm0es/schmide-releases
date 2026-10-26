@@ -17,6 +17,9 @@ on:
         description: "Publish as a draft (not offered to installs and updates until published)"
         type: boolean
         default: false
+      hub_ref:
+        description: "schmide-hub ref to build"
+        default: "main"
 
 permissions:
   contents: write
@@ -136,8 +139,78 @@ jobs:
             extra/install.sh
             extra/install.ps1
 
+  # The always-on sync peer (private repo schm0es/schmide-hub): a plain binary per
+  # platform, installed by install-hub.sh. Not part of latest.json, so the app's
+  # updater never sees it.
+  hub:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, asset: schmide-hub-linux-x86_64.tar.gz }
+          - { os: ubuntu-22.04-arm, asset: schmide-hub-linux-aarch64.tar.gz }
+          - { os: macos-latest, asset: schmide-hub-macos-universal.tar.gz }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The hub depends on schmide's core crate by path (../schmide/src-tauri/crates/core).
+      - uses: actions/checkout@v4
+        with:
+          repository: schm0es/schmide
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: schmide
+
+      - uses: actions/checkout@v4
+        with:
+          repository: schm0es/schmide-hub
+          ref: ${{ inputs.hub_ref }}
+          ssh-key: ${{ secrets.HUB_DEPLOY_KEY }}
+          path: schmide-hub
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: schmide-hub
+
+      # No --locked: the core crate's dependencies may be ahead of the hub's lockfile.
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --manifest-path schmide-hub/Cargo.toml
+          tar -czf ${{ matrix.asset }} -C schmide-hub/target/release schmide-hub
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --manifest-path schmide-hub/Cargo.toml --target $t
+          done
+          mkdir -p out
+          lipo -create -output out/schmide-hub schmide-hub/target/aarch64-apple-darwin/release/schmide-hub schmide-hub/target/x86_64-apple-darwin/release/schmide-hub
+          tar -czf ${{ matrix.asset }} -C out schmide-hub
+
+      - name: Checksum
+        run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+
+      - name: Installer
+        if: matrix.os == 'ubuntu-22.04'
+        run: mkdir -p extra && cp schmide-hub/scripts/install.sh extra/install-hub.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+            extra/install-hub.sh
+
   publish:
-    needs: build
+    needs: [build, hub]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
