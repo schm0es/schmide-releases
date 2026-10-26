@@ -1,6 +1,7 @@
 # Builds a tag of the (private) schmide source and publishes it here: one
 # archive per platform, each signed with the updater key, plus latest.json
-# (what installed apps check for updates) and install.sh (the curl installer).
+# (what installed apps check for updates), latest-hub.json (what installed hubs
+# check for updates) and install.sh (the curl installer).
 # Started by scripts/release.sh in the source repo, or by hand from the Actions tab.
 name: release
 
@@ -140,8 +141,9 @@ jobs:
             extra/install.ps1
 
   # The always-on sync peer (private repo schm0es/schmide-hub): a plain binary per
-  # platform, installed by install-hub.sh. Not part of latest.json, so the app's
-  # updater never sees it.
+  # platform, installed by install-hub.sh. Signed with the updater key and listed
+  # in latest-hub.json (not latest.json, so the app's updater never sees them),
+  # which the hub's own `schmide-hub update` checks.
   hub:
     strategy:
       matrix:
@@ -169,6 +171,12 @@ jobs:
           ssh-key: ${{ secrets.HUB_DEPLOY_KEY }}
           path: schmide-hub
 
+      - name: Version
+        id: version
+        run: |
+          v=$(node -p "require('./schmide/src-tauri/tauri.conf.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -180,12 +188,16 @@ jobs:
       # No --locked: the core crate's dependencies may be ahead of the hub's lockfile.
       - name: Build (Linux)
         if: runner.os == 'Linux'
+        env:
+          SCHMIDE_HUB_VERSION: ${{ steps.version.outputs.version }}
         run: |
           cargo build --release --manifest-path schmide-hub/Cargo.toml
           tar -czf ${{ matrix.asset }} -C schmide-hub/target/release schmide-hub
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
+        env:
+          SCHMIDE_HUB_VERSION: ${{ steps.version.outputs.version }}
         run: |
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --release --manifest-path schmide-hub/Cargo.toml --target $t
@@ -197,6 +209,12 @@ jobs:
       - name: Checksum
         run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
+      - name: Sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: npx --yes @tauri-apps/cli@2.12.0 signer sign ${{ matrix.asset }}
+
       - name: Installer
         if: matrix.os == 'ubuntu-22.04'
         run: mkdir -p extra && cp schmide-hub/scripts/install.sh extra/install-hub.sh
@@ -206,6 +224,7 @@ jobs:
           name: ${{ matrix.asset }}
           path: |
             ${{ matrix.asset }}
+            ${{ matrix.asset }}.sig
             ${{ matrix.asset }}.sha256
             extra/install-hub.sh
 
@@ -218,7 +237,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: latest.json
+      - name: latest.json, latest-hub.json
         env:
           V: ${{ needs.build.outputs.version }}
           NOTES: ${{ inputs.notes }}
@@ -231,10 +250,12 @@ jobs:
           def entry(asset):
               return {"url": f"{base}/{asset}", "signature": open(f"{d}/{asset}.sig").read()}
           mac = entry("schmide-macos-universal.app.tar.gz")
+          hubmac = entry("schmide-hub-macos-universal.tar.gz")
+          pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           json.dump({
               "version": os.environ["V"],
               "notes": os.environ["NOTES"],
-              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "pub_date": pub_date,
               "platforms": {
                   "linux-x86_64": entry("schmide-linux-x86_64.tar.gz"),
                   "linux-aarch64": entry("schmide-linux-aarch64.tar.gz"),
@@ -243,6 +264,17 @@ jobs:
                   "windows-x86_64": entry("schmide-windows-x86_64-setup.exe"),
               },
           }, open(f"{d}/latest.json", "w"), indent=2)
+          json.dump({
+              "version": os.environ["V"],
+              "notes": os.environ["NOTES"],
+              "pub_date": pub_date,
+              "platforms": {
+                  "linux-x86_64": entry("schmide-hub-linux-x86_64.tar.gz"),
+                  "linux-aarch64": entry("schmide-hub-linux-aarch64.tar.gz"),
+                  "darwin-aarch64": hubmac,
+                  "darwin-x86_64": hubmac,
+              },
+          }, open(f"{d}/latest-hub.json", "w"), indent=2)
           EOF
           ls -l dist
 
