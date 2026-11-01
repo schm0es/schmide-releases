@@ -121,7 +121,15 @@ jobs:
           if ($p.HasExited) { throw "schmide exited with $($p.ExitCode)" }
           Stop-Process $p
 
+      - name: Checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash ./${{ matrix.asset }} -Algorithm SHA256).Hash.ToLower()
+          "$h  ${{ matrix.asset }}" | Out-File -Encoding ascii ${{ matrix.asset }}.sha256
+
       - name: Checksum
+        if: runner.os != 'Windows'
         run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
       - name: Sign
