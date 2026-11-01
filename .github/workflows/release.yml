@@ -121,6 +121,9 @@ jobs:
           if ($p.HasExited) { throw "schmide exited with $($p.ExitCode)" }
           Stop-Process $p
 
+      - name: Checksum
+        run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+
       - name: Sign
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -137,6 +140,7 @@ jobs:
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sig
+            ${{ matrix.asset }}.sha256
             extra/install.sh
             extra/install.ps1
 
